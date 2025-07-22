@@ -1,34 +1,51 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
-#include <WiFiManager.h> //https://github.com/tzapu/WiFiManager WiFi Configuration Magic
+#include <WiFiManager.h>   // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include "PwmControl.h"
-#include <WebServer.h>
+#include <WebServer.h>     // For incoming POST, GET requests
+#include <HTTPClient.h>    // For outgoing POST requests
+#include <WiFi.h>          // Needed for HTTPClient and WiFi functions
 #include <ArduinoJson.h>
+#include <atomic>
 #include <dmx.h>
-//The reason why dmx.h didn't work is because it is hard coded to use pin 4 for the direction pin
-//If there is still issues look into using a different library like SparkFunDMX
+//Make sure to update the library variables from the README
 //#include <SparkFunDMX.h>
 
 #define MAX_DMX_CHANNELS 512
-#define LED_START_CHANNEL 220 //The channel the LEDs start on the lightkey universe
-#define LED_STRIP_AMOUNT 12 //The amount of LED strips in the lightkey universe
-#define CONTROLLER_COUNT 3 //Adafruit 16 channel 12 bit PWM controllers
+#define LED_START_CHANNEL 220   // The channel the LEDs start on the lightkey universe
+#define LED_STRIP_AMOUNT 10     // The amount of LED strips currently used
+#define CONTROLLER_COUNT 3      // Adafruit 16 channel 12 bit PWM controllers
 #define CHANNELS_PER_CONTROLLER 16
 #define CONTROLLER_FIRST_ADDRESS 0x40
 #define CONTROLLER_FREQ 600
 #define PORT 800
+#define LOGGING_URL "http://10.10.10.69" // URL to send the DMX log to
 
 void taskProcessDMX(void *parameter);
 void taskProcessNetwork(void *parameter);
 void taskIdle(void *parameter);
+void printDMXData(uint8_t *chanVal); 
+void checkUnexpectedColorData(uint8_t *chanVal, size_t *length);
+void pulseLogic(int *pulseValue);
+void setDMXLights(uint8_t *chanVal);
+void sendDMXLog(uint8_t *dmxData);
 
-volatile bool pulseMode = false;
-volatile bool manualMode = false;
+//atomic flags for thread-safe mode control
+std::atomic<bool> pulseMode(false); 
+std::atomic<bool> manualMode(false);
+
+struct RGBW {
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+  uint8_t w;
+};
+volatile RGBW postColor; 
+
 const uint8_t BUTTON_PIN = 0;
 const uint8_t LED_PIN = GPIO_NUM_13;
-int8_t pulseDirection = 1;
-int pulseSpeed = 2; // Speed of the pulse effect
-int pulseValue = 0; // instead of uint8_t
+volatile int8_t pulseDirection = 1;
+volatile int pulseSpeed = 2; // Speed of the pulse effect
 
 PwmControl *pwmControllers[CONTROLLER_COUNT];
 WiFiManager wifiManager;
@@ -54,20 +71,29 @@ void handlePost()
   bool pulse = jsonDocument["pulse"] | false;
   bool manual = jsonDocument["manual"] | false;
   int pulseSpeed = jsonDocument["pulseSpeed"] | 2;
+  
+  //Default false values for pulse and manual
+  pulseMode.store(false);
+  manualMode.store(false);
+
+  uint8_t red = jsonDocument["red"] | 0;
+  uint8_t green = jsonDocument["green"] | 0;
+  uint8_t blue = jsonDocument["blue"] | 0;
+  uint8_t white = jsonDocument["white"] | 0;
+
+  postColor.r = red;
+  postColor.g = green;
+  postColor.b = blue;
+  postColor.w = white;
 
   if (pulse) {
-    pulseMode = true;
-    server.send(200, "application/json", "{\"message\":\"pulse mode enabled\"}");
+    pulseMode.store(true);
+    server.send(200, "application/json", "{\"message\":\"pulse mode enabled, Ignoring DMX\"}");
   }
   if (manual) {
-    manualMode = true;
+    manualMode.store(true);
     server.send(200, "application/json", "{\"message\":\"manual mode enabled, ignoring DMX data\"}");
   }
-
-  uint8_t red = jsonDocument["red"];
-  uint8_t green = jsonDocument["green"];
-  uint8_t blue = jsonDocument["blue"];
-  uint8_t white = jsonDocument["white"];
 
   if (multi) { //Currently causes it to turn on and then immediately turn off
     for (int controllerNum = 0; controllerNum < CONTROLLER_COUNT; controllerNum++) {
@@ -89,6 +115,34 @@ void handlePost()
       server.send(500, "application/json", "{\"message\":\"Invalid channel\"}");
     }
   }
+}
+
+void sendDMXLog(uint8_t *dmxData) {
+  StaticJsonDocument<1024> jsonDocument;
+  jsonDocument["type"] = "dmx_log";
+  char timestamp[25];
+  time_t now = time(nullptr);
+  strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now));
+  jsonDocument["timestamp"] = timestamp;
+
+  for (uint8_t led = 0; led < LED_STRIP_AMOUNT; led++) {
+    jsonDocument["LED Strip"][led + 1]["R"] = dmxData[led * 4];
+    jsonDocument["LED Strip"][led + 1]["G"] = dmxData[led * 4 + 1];
+    jsonDocument["LED Strip"][led + 1]["B"] = dmxData[led * 4 + 2];
+    jsonDocument["LED Strip"][led + 1]["W"] = dmxData[led * 4 + 3];
+  }
+  String jsonString;
+  serializeJson(jsonDocument, jsonString);
+
+  HTTPClient http;
+  http.begin(LOGGING_URL);
+  http.addHeader("Content-Type", "application/json");
+  int responseCode = http.POST(jsonString);
+  Serial.println(responseCode);
+  http.end();
+
+
+  // Find a way to send a POST request to a server that this chip can handle
 }
 
 void setup_routing()
@@ -117,8 +171,7 @@ void setup() //Gets run once
   }
 
   TaskHandle_t xDMXHandle = NULL;
-  //2176 = stack size, which is the amount of memory allocated for the task
-  xTaskCreatePinnedToCore(taskProcessDMX, "taskProcessDMX", 2176, NULL, 2, &xDMXHandle, 1);
+  xTaskCreatePinnedToCore(taskProcessDMX, "taskProcessDMX", 4096, NULL, 2, &xDMXHandle, 1);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   wifiManager.setConfigPortalTimeout(30);
@@ -158,45 +211,13 @@ void setup() //Gets run once
   ArduinoOTA.begin();
 
   setup_routing();
-  // initialize PWM controllers
 
   TaskHandle_t xNetHandle = NULL;
   xTaskCreate(taskProcessNetwork, "taskProcessNetwork", 4096, NULL, 1, &xNetHandle);
 }
 
 void loop() {
-  delay(100); // Adjust as needed
-}
-
-void checkButton()
-{
-  static bool portalRunning = false;
-  // is auto timeout portal running
-  if (portalRunning)
-  {
-    wifiManager.process();
-  }
-
-  // is configuration portal requested?
-  if (digitalRead(BUTTON_PIN) == LOW)
-  {
-    delay(100);
-    if (digitalRead(BUTTON_PIN) == LOW)
-    {
-      if (!portalRunning)
-      {
-        Serial.println("Button Pressed, Starting Portal");
-        wifiManager.startWebPortal();
-        portalRunning = true;
-      }
-      else
-      {
-        Serial.println("Button Pressed, Stopping Portal");
-        wifiManager.stopWebPortal();
-        portalRunning = false;
-      }
-    }
-  }
+  delay(100);
 }
 
 void taskProcessNetwork(void *parameter)
@@ -216,33 +237,25 @@ void taskProcessDMX(void *parameter)
   uint8_t chanVal[CONTROLLER_COUNT * CHANNELS_PER_CONTROLLER + 1];
   uint8_t lastValidData[CONTROLLER_COUNT * CHANNELS_PER_CONTROLLER + 1];
   uint8_t counter = 0;
+  int pulseValue = 0;
   const uint8_t print_every = 100;
   for (;;)
   {
-    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
 
-    //Pauses the task until manualMode is set to false from the API
-    while (manualMode) {}
+    if (manualMode.load()) {
+      // Serial.println("Manual mode enabled, skipping DMX processing");
+      continue;
+    }
 
     //This is to test how smooth the leds are when changing the brightness
-    if (pulseMode) {
-      for (int ledStrip = 0; ledStrip < LED_STRIP_AMOUNT; ledStrip++) {
-        pwmControllers[0]->SetColor(ledStrip*4, 0, 0, 0, (uint8_t)pulseValue);
-        pwmControllers[1]->SetColor(ledStrip*4, 0, 0, 0, (uint8_t)pulseValue);
-        pwmControllers[2]->SetColor(ledStrip*4, 0, 0, 0, (uint8_t)pulseValue);
-      }
-
-      // Bounce pulseValue between 0 and 255
-      pulseValue += pulseDirection * pulseSpeed;
-      if (pulseValue >= 255) {
-        pulseValue = 255;
-        pulseDirection = -1;
-      } else if (pulseValue <= 0) {
-        pulseValue = 0;
-        pulseDirection = 1;
-      }
+    if (pulseMode.load()) {
+      pulseLogic(&pulseValue);
       continue; // skip DMX processing when in pulse mode
     }
+
+    //Without this delay the LEDs will flash random colors
+    //Will need to play with the value to see how much it effects the performance
+    xTaskDelayUntil(&xLastWakeTime, 100 / portTICK_PERIOD_MS);
 
     if (!DMX::IsHealthy()) { //If no DMX data is available
 
@@ -250,61 +263,24 @@ void taskProcessDMX(void *parameter)
       Serial.println("DMX is not healthy, skipping read");
 
       //Sets the LEDs to the last valid data
-      for (int channel = 0; channel < sizeof(lastValidData) - 9; channel += 4)
-      {
-        uint8_t controllerNum = channel / CHANNELS_PER_CONTROLLER;
-        pwmControllers[controllerNum]->SetColor(
-            channel - (controllerNum * CHANNELS_PER_CONTROLLER),
-            lastValidData[channel], lastValidData[channel + 1], lastValidData[channel + 2], lastValidData[channel + 3]);
-      }
+      setDMXLights(lastValidData);
       continue; //Skips DMX
     }
 
     digitalWrite(LED_PIN, HIGH); //turns on the LED
 
     //Currently there is a issue on the lights not being smooth when changing values
-    DMX::ReadAll(chanVal, LED_START_CHANNEL, sizeof(chanVal) - 9);
-    for (int channel = 0; channel < sizeof(chanVal) - 9; channel += 4)
-    {
-      uint8_t controllerNum = channel / CHANNELS_PER_CONTROLLER;
-      pwmControllers[controllerNum]->SetColor(
-          channel - (controllerNum * CHANNELS_PER_CONTROLLER),
-          chanVal[channel], chanVal[channel + 1], chanVal[channel + 2], chanVal[channel + 3]);
-    }
- 
-    Serial.println("DMX data:");
-
-    // Formatting so the data is easier to read
-    // Print the channel values in groups of 5 CH(W, R, G, B)
-    //Could be imporoved to be a function call
-    const int groupSize = 4;
-    const int groupsPerLine = 5;
-
-    int totalGroups = (sizeof(chanVal) - 9) / groupSize;
-
-    for (int i = 0; i < totalGroups; i++) {
-      int index = i * groupSize;
-
-      Serial.printf("%d(", i);
-      
-      for (int j = 0; j < groupSize; j++) {
-        Serial.printf("%d", chanVal[index + j]);
-        if (j < groupSize - 1) Serial.print(", ");
-      }
-
-      Serial.print(")");
-
-      if ((i + 1) % groupsPerLine == 0 || i == totalGroups - 1) {
-        Serial.println();
-      } else {
-        Serial.print("  ");
-      }
-    }
+    DMX::ReadAll(chanVal, LED_START_CHANNEL, sizeof(chanVal) - 1);
+    setDMXLights(chanVal);
 
     if (counter % print_every * 20 == 0 && DMX::IsHealthy()) {
       memcpy(lastValidData, chanVal, sizeof(chanVal)); // Copy the current data to lastValidData
     }
+
+    // printDMXData(chanVal);
     counter++;
+    // yield(); // Allow other tasks to run
+
   }
 }
 
@@ -313,5 +289,78 @@ void taskIdle(void *parameter)
   while (true)
   {
     Serial.print(".");
+  }
+}
+
+void printDMXData(uint8_t *chanVal) {
+  Serial.println("DMX data:");
+
+  // Formatting so the data is easier to read
+  for (uint8_t controller = 0; controller < CONTROLLER_COUNT; controller++) {
+    for (uint8_t channel = 0; channel < CHANNELS_PER_CONTROLLER; channel += 4) {
+        uint8_t currentChannel = channel + (controller * CHANNELS_PER_CONTROLLER);
+        Serial.printf("LED: %d, Controller %d, Channel %d: R:%d G:%d B:%d W:%d\n",
+            currentChannel/4, controller, currentChannel,
+            chanVal[currentChannel], chanVal[currentChannel + 1],
+            chanVal[currentChannel + 2], chanVal[currentChannel + 3]);
+    }
+  }
+}
+
+void pulseLogic(int *pulseValue) {
+
+  uint8_t red = *pulseValue;
+  uint8_t green = *pulseValue;
+  uint8_t blue = *pulseValue;
+  uint8_t white = *pulseValue;
+
+  // Will check if the POST request sent any color values
+  // If not, it will set them to 0 | else it will pulse the color
+  if (postColor.r < 1) {
+    red = 0;
+  }
+  if (postColor.g < 1) {
+    green = 0;
+  }
+  if (postColor.b < 1) {
+    blue = 0;
+  }
+  if (postColor.w < 1) {
+    white = 0;
+  }
+
+  // Pulse effect logic
+  // This will set the color of all LEDs to the pulse value
+  for (int ledStrip = 0; ledStrip < LED_STRIP_AMOUNT; ledStrip++) {
+    for (uint8_t controller = 0; controller < CONTROLLER_COUNT; controller++) {
+      pwmControllers[controller]->SetColor(ledStrip*4, red, green, blue, white);
+    }
+  }
+
+  // Bounce pulseValue between 0 and 255
+  *pulseValue += pulseDirection * pulseSpeed;
+
+  if (*pulseValue >= 255) {
+    *pulseValue = 255;
+    pulseDirection = -1;
+  } else if (*pulseValue <= 0) {
+    *pulseValue = 0;
+    pulseDirection = 1;
+  }
+}
+
+void setDMXLights(uint8_t *chanVal) {
+  for (uint8_t controller = 0; controller < CONTROLLER_COUNT; controller++) {
+    for (uint8_t channel = 0; channel < CHANNELS_PER_CONTROLLER; channel += 4) {
+        // Calculate the actual channel index
+        uint8_t currentChannel = channel + (controller * CHANNELS_PER_CONTROLLER);
+
+        if ((controller * channel)/ 4 >= LED_STRIP_AMOUNT) {
+          return; // Prevents out of bounds access writes
+        }
+        pwmControllers[controller]->SetColor(
+          channel, chanVal[currentChannel], chanVal[currentChannel + 1],
+          chanVal[currentChannel + 2], chanVal[currentChannel + 3]);
+    }
   }
 }
