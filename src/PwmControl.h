@@ -25,12 +25,6 @@ public:
     ~PwmControl();
     void begin();
     void SetColor(uint8_t channel, uint8_t red, uint8_t green, uint8_t blue, uint8_t white);
-    void SetRed(uint8_t channel, uint8_t value);
-    void SetGreen(uint8_t channel, uint8_t value);
-    void SetBlue(uint8_t channel, uint8_t value);
-    void SetWhite(uint8_t channel, uint8_t value);
-    void On(uint8_t channel);
-    void Off(uint8_t channel);
 };
 
 class ColorData{

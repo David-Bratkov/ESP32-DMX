@@ -1,63 +1,53 @@
 # ESP32 DMX LED Controller
 
-This project reads DMX512 data using an ESP32 and controls up to 3 Adafruit PCA9685 16-channel PWM controllers to drive RGBW LED strips. It includes a web server for manual color control and OTA updates.
+A multithreaded ESP32 project for controlling RGBW LED strips via DMX512, with built-in web control, OTA firmware updates, and flexible lighting modes like **pulse** and **manual override**. Designed to drive up to **3 Adafruit PCA9685 PWM controllers**.
 
-## Features
+---
 
-- Reads DMX512 input (starting at channel 220)
-- Controls 12 RGBW LED strips (48 channels total)
-- Manual override via HTTP API
-- Pulse mode with adjustable speed
-- Wi-Fi config using API (WiFiManager)
-- OTA firmware updates (ArduinoOTA)
+## 🔧 Features
 
-## Requirements
+* ✅ **DMX512 input** via UART2 (starting at channel `220`)
+* ✅ **Controls up to 12 RGBW LED strips** via I2C PWM (48 channels)
+* ✅ **Web server (HTTP API)** for remote control, override, and color setting
+* ✅ **Pulse effect** with dynamic brightness and color support
+* ✅ **Manual mode** to override DMX input
+* ✅ **Wi-Fi configuration** via captive portal (WiFiManager)
+* ✅ **OTA firmware updates** via ArduinoOTA
+* ✅ **Failsafe fallback** to last known good DMX values
+* ✅ **Multithreaded task separation** (DMX vs Network)
 
-### Hardware
+---
 
-- ESP32
-- 1–3x Adafruit PCA9685 16-channel PWM controllers
-- RGBW LED strips
-- RS485 to UART converter (for DMX input)
-- Optional: status LED on GPIO 13
+## 📦 Hardware Requirements
 
-### Libraries
+* ESP32
+* 1–3x Adafruit PCA9685 16-channel PWM drivers
+* RGBW LED strips (12 max)
+* RS485 → UART converter (DMX input)
+* Status LED (optional) on GPIO 13
+* Button (optional) on GPIO 0 for Wi-Fi config reset
+
+---
+
+## 📚 Library Dependencies
 
 Install via Arduino Library Manager:
 
-- WiFiManager
-- ArduinoJson
-- ArduinoOTA
-- Adafruit PWM Servo Driver
-- A DMX library (custom or SparkFunDMX)
+* `esp_dmx` (ESP-IDF native DMX support)
+* `Adafruit PWM Servo Driver`
+* `WiFiManager`
+* `ArduinoOTA`
+* `ArduinoJson`
 
 ---
 
-Modify `dmx.cpp` as follows:
-```c++
-#include <dmx.h>
-#include <Arduino.h>
-
-#define DMX_SERIAL_INPUT_PIN    GPIO_NUM_16 // pin for dmx rx
-#define DMX_SERIAL_OUTPUT_PIN   GPIO_NUM_17 // pin for dmx tx
-#define DMX_SERIAL_IO_PIN       GPIO_NUM_21 // pin for dmx rx/tx change
-
-#define DMX_UART_NUM            UART_NUM_2  // dmx uart
-#define HEALTHY_TIME            500         // timeout in ms 
-#define BUF_SIZE                1024        //  buffer size for rx events
-#define DMX_CORE                1           // select the core the rx/tx thread should run on
-#define DMX_IGNORE_THREADSAFETY 0           // set to 1 to disable all threadsafe mechanisms
-```
-
----
-
-## Web API
+## 🌐 Web API
 
 ### POST `/led`
 
-Update colors for one or all channels. Also used to enable pulse or manual mode.
+Control color, pulse, or manual mode via HTTP POST (port `800`).
 
-#### JSON Format
+#### JSON Payload:
 
 ```json
 {
@@ -66,55 +56,87 @@ Update colors for one or all channels. Also used to enable pulse or manual mode.
   "manual": true,
   "pulseSpeed": 2,
   "channel": 5,
-  //Color values range from 0-255
   "red": 128,
   "green": 64,
   "blue": 255,
   "white": 0
 }
-
 ```
 
-- `multi`: If `true`, updates all strips.
-- `channel`: Channel index (0–47) if `multi` is `false`.
-- `pulse`: Enables automatic pulsing (disables DMX).
-- `manual`: Enables manual mode (disables DMX).
-- `pulseSpeed`: A multiplier that determines how quickly the pulse effect runs.
----
-
-## Behavior
-
-- DMX is read continuously unless manual or pulse mode is active.
-- If DMX is not detected, the last known values are held.
-- Button on GPIO 0 starts/stops Wi-Fi config portal (captive mode).
-- Web server runs on port `800`.
+| Field                     | Type  | Description                                    |
+| ------------------------- | ----- | ---------------------------------------------- |
+| `multi`                   | bool  | Set all LED strips if true                     |
+| `channel`                 | int   | Strip index (0–47) if `multi` is false         |
+| `red, green, blue, white` | 0–255 | RGBW values                                    |
+| `pulse`                   | bool  | Enables pulsing effect and disables DMX        |
+| `manual`                  | bool  | Enables manual color override and disables DMX |
+| `pulseSpeed`              | int   | (Optional) Speed of pulse animation            |
 
 ---
 
-## OTA Updates
+## ⚙️ Behavior Overview
 
-Once connected to Wi-Fi, upload firmware using ArduinoOTA. The ESP32 will appear as a network port in the Arduino IDE.
-
----
-
-## Flash Instructions
-
-1. Connect the ESP32 via USB.
-2. Open VSCode
-3. Install PlatformIO
-4. Plug the ESP32 using USB
-5. Use the built in flash button located on the top right
+* DMX is read continuously unless **pulse** or **manual** mode is active
+* In case of DMX timeout, last valid values are reused
+* Pulse mode uses color from last HTTP POST to animate brightness
+* Wi-Fi captive portal opens if saved credentials are missing (via button or boot)
+* OTA updates available once device is online
 
 ---
 
-## Notes
+## 📡 OTA Updates
 
-- My DMX LEDs address starts at 220. 
-- Each LED strip uses 4 channels: Red, Green, Blue, White.
+* Available over network using **Arduino IDE** or PlatformIO
+* Device will appear as a network port
+* OTA handles update progress and error reporting
 
 ---
 
-## TODO
+## 🧪 Debug Options
 
-- Figure out why the LED lights are flashing
-- Improve DMX fading behavior
+Enable `#define DEBUG_MODE true` to print:
+
+* Incoming DMX values
+* Invalid channel data
+* Debug logs for mode switching
+
+---
+
+## 🔌 Pin Configuration
+
+| Function    | GPIO    |
+| ----------- | ------- |
+| DMX RX      | 16      |
+| DMX TX      | 17      |
+| DMX RTS     | 21      |
+| I2C SDA/SCL | Default |
+| Status LED  | 13      |
+| Button      | 0       |
+
+---
+
+## 🚀 Flashing Instructions
+
+1. Connect ESP32 via USB
+2. Open VSCode with PlatformIO or Arduino IDE
+3. Flash as normal (press/hold BOOT if required)
+4. Once booted, ESP32 will host a Wi-Fi config portal if no credentials are saved
+
+---
+
+## 📋 Notes
+
+* Each **LED strip** uses 4 DMX channels (R/G/B/W)
+* **DMX universe starts at channel 220** for this setup
+* **LED strip limit**: 12 total (48 DMX channels)
+* Web server runs on **port 800**
+
+---
+
+## ✅ TODO (as of now)
+
+* [x] Fix DMX flickering (✅ resolved via `esp_dmx`)
+* [ ] Improve fading interpolation for smoother transitions
+* [ ] Add GET `/status` endpoint for current mode/state
+
+---
